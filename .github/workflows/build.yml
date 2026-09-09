@@ -40,7 +40,9 @@ jobs:
         run: |
           $tag = $env:REQUESTED_TAG
           if ([string]::IsNullOrWhiteSpace($tag)) {
-            $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/2dust/v2rayN/releases/latest"
+            $latestJson = gh api repos/2dust/v2rayN/releases/latest
+            if ($LASTEXITCODE -ne 0) { throw "Unable to query the latest upstream release." }
+            $latest = $latestJson | ConvertFrom-Json
             $tag = $latest.tag_name
           }
 
