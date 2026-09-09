@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout builder repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve upstream version
         id: version
@@ -37,13 +37,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           $tag = $env:REQUESTED_TAG
           if ([string]::IsNullOrWhiteSpace($tag)) {
-            $latestJson = gh api repos/2dust/v2rayN/releases/latest
+            $tag = gh release view --repo 2dust/v2rayN --json tagName --jq .tagName
             if ($LASTEXITCODE -ne 0) { throw "Unable to query the latest upstream release." }
-            $latest = $latestJson | ConvertFrom-Json
-            $tag = $latest.tag_name
           }
 
           if ([string]::IsNullOrWhiteSpace($tag)) {
@@ -56,17 +55,24 @@ jobs:
           if ($LASTEXITCODE -eq 0) { $exists = $true }
           $global:LASTEXITCODE = 0
 
+          # Scheduled checks do nothing when this upstream release is already built.
+          # Push/manual runs intentionally rebuild and replace the custom assets so
+          # builder fixes can be applied without inventing a new upstream version.
+          $skip = $exists -and ($env:EVENT_NAME -eq "schedule")
+
           "upstream_tag=$tag" >> $env:GITHUB_OUTPUT
           "custom_tag=$customTag" >> $env:GITHUB_OUTPUT
           "exists=$($exists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           Write-Host "Upstream release: $tag"
           Write-Host "Custom release:   $customTag"
           Write-Host "Already exists:   $exists"
+          Write-Host "Skip this run:    $skip"
 
       - name: Checkout exact upstream release
-        if: steps.version.outputs.exists != 'true'
-        uses: actions/checkout@v4
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/checkout@v7
         with:
           repository: 2dust/v2rayN
           ref: ${{ steps.version.outputs.upstream_tag }}
@@ -75,7 +81,7 @@ jobs:
           submodules: recursive
 
       - name: Apply NoPromotion patch
-        if: steps.version.outputs.exists != 'true'
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
         working-directory: upstream
         run: |
@@ -90,17 +96,32 @@ jobs:
             throw "Post-patch validation failed."
           }
 
+      - name: Match upstream .NET toolchain
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          dotnet --list-sdks | ForEach-Object {
+            if ($_ -match '^\S+\s+\[(.+)\]$') {
+              $sdkPath = Join-Path $Matches[1] $_.Split()[0]
+              if (Test-Path $sdkPath) {
+                Write-Host "Removing preinstalled SDK $sdkPath"
+                Remove-Item $sdkPath -Recurse -Force
+              }
+            }
+          }
+
       - name: Setup .NET 10
-        if: steps.version.outputs.exists != 'true'
-        uses: actions/setup-dotnet@v4
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.1xx
 
       - name: Build Windows x64 WPF app
-        if: steps.version.outputs.exists != 'true'
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
         working-directory: upstream/v2rayN
         run: |
+          dotnet --version
           dotnet publish ./v2rayN/v2rayN.csproj `
             -c Release `
             -r win-x64 `
@@ -114,21 +135,58 @@ jobs:
 
           Get-ChildItem "../../custom-build" -Filter *.pdb -Recurse | Remove-Item -Force
 
-      - name: Package using the matching official release
-        if: steps.version.outputs.exists != 'true'
+      - name: Package using matching official release
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.version.outputs.upstream_tag }}"
           $asset = "v2rayN-windows-64.zip"
-          $url = "https://github.com/2dust/v2rayN/releases/download/$tag/$asset"
+          $officialDir = "official"
+          $officialZip = Join-Path $officialDir $asset
+          $appDir = "package/v2rayN-windows-64"
 
-          Invoke-WebRequest -Uri $url -OutFile upstream.zip
-          Expand-Archive upstream.zip -DestinationPath package -Force
+          New-Item -ItemType Directory -Path $officialDir -Force | Out-Null
+          gh release download $tag --repo 2dust/v2rayN --pattern $asset --dir $officialDir
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $officialZip)) {
+            throw "Failed to download the matching official Windows x64 package."
+          }
 
-          Copy-Item "custom-build/*" "package/" -Recurse -Force
+          Expand-Archive $officialZip -DestinationPath package -Force
+
+          # Upstream packaging stores the WPF app under this top-level directory.
+          # Do not copy our self-contained publish output to the ZIP root: that would
+          # duplicate the whole .NET application and nearly double the package size.
+          if (!(Test-Path "$appDir/v2rayN.exe")) {
+            throw "Unexpected upstream package layout: $appDir/v2rayN.exe was not found."
+          }
+          if (Test-Path "package/v2rayN.exe") {
+            throw "Unexpected root-level v2rayN.exe found before overlay."
+          }
+
+          Copy-Item "custom-build/*" $appDir -Recurse -Force
+
+          if (!(Test-Path "$appDir/v2rayN.exe")) {
+            throw "Patched v2rayN.exe is missing after overlay."
+          }
+          if (Test-Path "package/v2rayN.exe") {
+            throw "Packaging regression: patched application was copied to the ZIP root."
+          }
 
           $out = "v2rayN-$tag-NoPromotion-windows-64.zip"
           Compress-Archive -Path "package/*" -DestinationPath $out -CompressionLevel Fastest
+
+          $officialSize = (Get-Item $officialZip).Length
+          $customSize = (Get-Item $out).Length
+          $ratio = [math]::Round($customSize / $officialSize, 3)
+          Write-Host "Official ZIP: $officialSize bytes"
+          Write-Host "Custom ZIP:   $customSize bytes"
+          Write-Host "Size ratio:   $ratio"
+
+          if ($customSize -gt ($officialSize * 1.25)) {
+            throw "Custom package is more than 25% larger than upstream; refusing to publish a likely malformed package."
+          }
 
           $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $out" | Set-Content "$out.sha256" -Encoding ascii
@@ -136,35 +194,82 @@ jobs:
           "artifact=$out" >> $env:GITHUB_ENV
           "hashfile=$out.sha256" >> $env:GITHUB_ENV
 
+      - name: Create patched source archive
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.upstream_tag }}"
+          $sourceDir = "patched-source"
+          $sourceOut = "v2rayN-$tag-NoPromotion-source.zip"
+
+          New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+          Get-ChildItem "upstream" -Force | Where-Object { $_.Name -ne ".git" } | Copy-Item -Destination $sourceDir -Recurse -Force
+
+          # A checked-out Git submodule contains its own .git marker file. It is build
+          # metadata, not source, so exclude any remaining .git entries recursively.
+          Get-ChildItem $sourceDir -Force -Recurse | Where-Object { $_.Name -eq ".git" } | Remove-Item -Recurse -Force
+
+          Compress-Archive -Path "$sourceDir/*" -DestinationPath $sourceOut -CompressionLevel Fastest
+
+          $sourceHash = (Get-FileHash $sourceOut -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sourceHash  $sourceOut" | Set-Content "$sourceOut.sha256" -Encoding ascii
+
+          "sourceartifact=$sourceOut" >> $env:GITHUB_ENV
+          "sourcehashfile=$sourceOut.sha256" >> $env:GITHUB_ENV
+
       - name: Publish custom release
-        if: steps.version.outputs.exists != 'true'
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $upstreamTag = "${{ steps.version.outputs.upstream_tag }}"
           $customTag = "${{ steps.version.outputs.custom_tag }}"
+          $releaseExists = "${{ steps.version.outputs.exists }}" -eq "true"
 
           $notes = @"
           Unofficial Windows x64 WPF build of **v2rayN $upstreamTag** with one UI-only change: the Promotion toolbar entry is hidden.
 
           - Upstream source/release: https://github.com/2dust/v2rayN/releases/tag/$upstreamTag
-          - Customization: `patches/remove-promotion-ui.patch`
-          - Bundled proxy cores and non-UI package files come from the matching official `v2rayN-windows-64.zip` release package.
+          - Customization: patches/remove-promotion-ui.patch
+          - Bundled proxy cores and non-UI package files come from the matching official v2rayN-windows-64.zip release package.
+          - The patched source archive used for this build is attached.
           - No routing, proxy-core, DNS, or networking behavior is intentionally modified.
 
-          SHA-256 is attached alongside the ZIP.
+          SHA-256 files are attached alongside both ZIP archives.
           "@
 
-          gh release create $customTag `
-            $env:artifact `
-            $env:hashfile `
-            "patches/remove-promotion-ui.patch" `
-            --repo $env:GITHUB_REPOSITORY `
-            --title "v2rayN $upstreamTag NoPromotion" `
-            --notes $notes
+          if ($releaseExists) {
+            gh release upload $customTag `
+              $env:artifact `
+              $env:hashfile `
+              $env:sourceartifact `
+              $env:sourcehashfile `
+              "patches/remove-promotion-ui.patch" `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to replace release assets." }
+
+            gh release edit $customTag `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "v2rayN $upstreamTag NoPromotion" `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update release notes." }
+          }
+          else {
+            gh release create $customTag `
+              $env:artifact `
+              $env:hashfile `
+              $env:sourceartifact `
+              $env:sourcehashfile `
+              "patches/remove-promotion-ui.patch" `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "v2rayN $upstreamTag NoPromotion" `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create custom release." }
+          }
 
       - name: Nothing to do
-        if: steps.version.outputs.exists == 'true'
+        if: steps.version.outputs.skip == 'true'
         shell: pwsh
-        run: Write-Host "NoPromotion release ${{ steps.version.outputs.custom_tag }} already exists."
+        run: Write-Host "NoPromotion release ${{ steps.version.outputs.custom_tag }} already exists; scheduled check is complete."
