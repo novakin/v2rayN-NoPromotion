@@ -96,6 +96,38 @@ jobs:
             throw "Post-patch validation failed."
           }
 
+      - name: Create patched source archive
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.upstream_tag }}"
+          $sourceDir = "patched-source"
+          $sourceOut = "v2rayN-$tag-NoPromotion-source.zip"
+
+          # Create the source archive before compiling so bin/obj output can never
+          # leak into the corresponding-source package.
+          New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+          Get-ChildItem "upstream" -Force | Where-Object { $_.Name -ne ".git" } | Copy-Item -Destination $sourceDir -Recurse -Force
+
+          # A checked-out submodule contains its own .git marker file. Git metadata
+          # is not source, so remove any remaining .git entries recursively.
+          Get-ChildItem $sourceDir -Force -Recurse | Where-Object { $_.Name -eq ".git" } | Remove-Item -Recurse -Force
+
+          @"
+          This archive contains the corresponding source for the unofficial v2rayN $tag NoPromotion build.
+          Modification: the Promotion toolbar entry and its adjacent separator are hidden in the Windows WPF UI.
+          Build date (UTC): $(Get-Date -AsUTC -Format 'yyyy-MM-dd')
+          Upstream: https://github.com/2dust/v2rayN/releases/tag/$tag
+          "@ | Set-Content "$sourceDir/NOPROMOTION-MODIFICATION.txt" -Encoding utf8
+
+          Compress-Archive -Path "$sourceDir/*" -DestinationPath $sourceOut -CompressionLevel Fastest
+
+          $sourceHash = (Get-FileHash $sourceOut -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sourceHash  $sourceOut" | Set-Content "$sourceOut.sha256" -Encoding ascii
+
+          "sourceartifact=$sourceOut" >> $env:GITHUB_ENV
+          "sourcehashfile=$sourceOut.sha256" >> $env:GITHUB_ENV
+
       - name: Match upstream .NET toolchain
         if: steps.version.outputs.skip != 'true'
         shell: pwsh
@@ -129,13 +161,11 @@ jobs:
             -p:EnableWindowsTargeting=true `
             -o ../../custom-build
 
-          if (!(Test-Path "../../custom-build/v2rayN.exe")) {
-            throw "v2rayN.exe was not produced."
+          if (!(Test-Path "../../custom-build/v2rayN.dll")) {
+            throw "v2rayN.dll was not produced."
           }
 
-          Get-ChildItem "../../custom-build" -Filter *.pdb -Recurse | Remove-Item -Force
-
-      - name: Package using matching official release
+      - name: Package from matching official release
         if: steps.version.outputs.skip != 'true'
         shell: pwsh
         env:
@@ -145,7 +175,12 @@ jobs:
           $asset = "v2rayN-windows-64.zip"
           $officialDir = "official"
           $officialZip = Join-Path $officialDir $asset
-          $appDir = "package/v2rayN-windows-64"
+          $archiveDll = "v2rayN-windows-64\v2rayN.dll"
+          $customDll = "custom-build/v2rayN.dll"
+
+          if (!(Get-Command 7z -ErrorAction SilentlyContinue)) {
+            throw "7-Zip is not available on the GitHub runner."
+          }
 
           New-Item -ItemType Directory -Path $officialDir -Force | Out-Null
           gh release download $tag --repo 2dust/v2rayN --pattern $asset --dir $officialDir
@@ -153,39 +188,67 @@ jobs:
             throw "Failed to download the matching official Windows x64 package."
           }
 
-          Expand-Archive $officialZip -DestinationPath package -Force
+          # Extract only the upstream application assembly for validation. The output
+          # ZIP itself starts as an exact copy of the official release package.
+          New-Item -ItemType Directory -Path "official-extract" -Force | Out-Null
+          & 7z x $officialZip $archiveDll "-oofficial-extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to inspect the official package." }
 
-          # Upstream packaging stores the WPF app under this top-level directory.
-          # Do not copy our self-contained publish output to the ZIP root: that would
-          # duplicate the whole .NET application and nearly double the package size.
-          if (!(Test-Path "$appDir/v2rayN.exe")) {
-            throw "Unexpected upstream package layout: $appDir/v2rayN.exe was not found."
-          }
-          if (Test-Path "package/v2rayN.exe") {
-            throw "Unexpected root-level v2rayN.exe found before overlay."
+          $officialDll = "official-extract/v2rayN-windows-64/v2rayN.dll"
+          if (!(Test-Path $officialDll)) {
+            throw "Unexpected upstream package layout: $archiveDll was not found."
           }
 
-          Copy-Item "custom-build/*" $appDir -Recurse -Force
-
-          if (!(Test-Path "$appDir/v2rayN.exe")) {
-            throw "Patched v2rayN.exe is missing after overlay."
+          $officialDllHash = (Get-FileHash $officialDll -Algorithm SHA256).Hash
+          $customDllHash = (Get-FileHash $customDll -Algorithm SHA256).Hash
+          Write-Host "Official v2rayN.dll SHA256: $officialDllHash"
+          Write-Host "Patched  v2rayN.dll SHA256: $customDllHash"
+          if ($officialDllHash -eq $customDllHash) {
+            throw "Patched assembly is byte-identical to upstream; refusing to publish because the UI patch was not reflected in the build."
           }
-          if (Test-Path "package/v2rayN.exe") {
-            throw "Packaging regression: patched application was copied to the ZIP root."
+
+          $officialDllSize = (Get-Item $officialDll).Length
+          $customDllSize = (Get-Item $customDll).Length
+          if ($customDllSize -gt ($officialDllSize * 1.20) -or $customDllSize -lt ($officialDllSize * 0.80)) {
+            throw "Patched assembly size differs unexpectedly from upstream."
           }
 
           $out = "v2rayN-$tag-NoPromotion-windows-64.zip"
-          Compress-Archive -Path "package/*" -DestinationPath $out -CompressionLevel Fastest
+          Copy-Item $officialZip $out -Force
+
+          # The XAML change is compiled into v2rayN.dll. Replace only that one archive
+          # entry; every core, runtime file, helper executable and config remains the
+          # exact file shipped in the matching official v2rayN release.
+          $overlayDir = "overlay/v2rayN-windows-64"
+          New-Item -ItemType Directory -Path $overlayDir -Force | Out-Null
+          Copy-Item $customDll "$overlayDir/v2rayN.dll" -Force
+
+          Push-Location overlay
+          & 7z u -tzip -mx=1 "../$out" "v2rayN-windows-64\v2rayN.dll" | Out-Host
+          $sevenZipExit = $LASTEXITCODE
+          Pop-Location
+          if ($sevenZipExit -ne 0) { throw "Failed to update the official package with the patched assembly." }
 
           $officialSize = (Get-Item $officialZip).Length
           $customSize = (Get-Item $out).Length
-          $ratio = [math]::Round($customSize / $officialSize, 3)
+          $ratio = [math]::Round($customSize / $officialSize, 4)
           Write-Host "Official ZIP: $officialSize bytes"
           Write-Host "Custom ZIP:   $customSize bytes"
           Write-Host "Size ratio:   $ratio"
 
-          if ($customSize -gt ($officialSize * 1.25)) {
-            throw "Custom package is more than 25% larger than upstream; refusing to publish a likely malformed package."
+          # One application DLL is the only intended archive change. A package that
+          # grows materially beyond upstream is therefore a packaging regression.
+          if ($customSize -gt ($officialSize * 1.05)) {
+            throw "Custom package is more than 5% larger than upstream; refusing to publish a malformed package."
+          }
+
+          # Re-extract the DLL from the final archive and prove it is our patched DLL.
+          Remove-Item "final-check" -Recurse -Force -ErrorAction SilentlyContinue
+          & 7z x $out $archiveDll "-ofinal-check" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to validate final package." }
+          $finalDllHash = (Get-FileHash "final-check/v2rayN-windows-64/v2rayN.dll" -Algorithm SHA256).Hash
+          if ($finalDllHash -ne $customDllHash) {
+            throw "Final package does not contain the patched assembly."
           }
 
           $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -193,29 +256,6 @@ jobs:
 
           "artifact=$out" >> $env:GITHUB_ENV
           "hashfile=$out.sha256" >> $env:GITHUB_ENV
-
-      - name: Create patched source archive
-        if: steps.version.outputs.skip != 'true'
-        shell: pwsh
-        run: |
-          $tag = "${{ steps.version.outputs.upstream_tag }}"
-          $sourceDir = "patched-source"
-          $sourceOut = "v2rayN-$tag-NoPromotion-source.zip"
-
-          New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
-          Get-ChildItem "upstream" -Force | Where-Object { $_.Name -ne ".git" } | Copy-Item -Destination $sourceDir -Recurse -Force
-
-          # A checked-out Git submodule contains its own .git marker file. It is build
-          # metadata, not source, so exclude any remaining .git entries recursively.
-          Get-ChildItem $sourceDir -Force -Recurse | Where-Object { $_.Name -eq ".git" } | Remove-Item -Recurse -Force
-
-          Compress-Archive -Path "$sourceDir/*" -DestinationPath $sourceOut -CompressionLevel Fastest
-
-          $sourceHash = (Get-FileHash $sourceOut -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$sourceHash  $sourceOut" | Set-Content "$sourceOut.sha256" -Encoding ascii
-
-          "sourceartifact=$sourceOut" >> $env:GITHUB_ENV
-          "sourcehashfile=$sourceOut.sha256" >> $env:GITHUB_ENV
 
       - name: Publish custom release
         if: steps.version.outputs.skip != 'true'
@@ -232,8 +272,9 @@ jobs:
 
           - Upstream source/release: https://github.com/2dust/v2rayN/releases/tag/$upstreamTag
           - Customization: patches/remove-promotion-ui.patch
-          - Bundled proxy cores and non-UI package files come from the matching official v2rayN-windows-64.zip release package.
-          - The patched source archive used for this build is attached.
+          - The binary ZIP starts from the matching official v2rayN-windows-64.zip package and replaces only v2rayN.dll, where the WPF XAML is compiled.
+          - All bundled proxy cores, .NET runtime files, helper executables and configuration files remain from the official package.
+          - The patched corresponding-source archive is attached.
           - No routing, proxy-core, DNS, or networking behavior is intentionally modified.
 
           SHA-256 files are attached alongside both ZIP archives.
