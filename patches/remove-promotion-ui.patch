@@ -1,0 +1,10 @@
+--- a/v2rayN/v2rayN/Views/MainWindow.xaml
++++ b/v2rayN/v2rayN/Views/MainWindow.xaml
+@@ -1,5 +1,5 @@
+                         </Menu>
+-                        <Separator />
+-                        <Menu Margin="0,1" Style="{StaticResource ToolbarMenu}">
++                        <Separator Visibility="Collapsed" />
++                        <Menu Margin="0,1" Style="{StaticResource ToolbarMenu}" Visibility="Collapsed">
+                             <MenuItem
+                                 x:Name="menuPromotion"
