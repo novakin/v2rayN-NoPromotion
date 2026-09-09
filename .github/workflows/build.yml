@@ -1,0 +1,168 @@
+name: Build v2rayN NoPromotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Official v2rayN release tag (leave empty for latest)"
+        required: false
+        type: string
+  schedule:
+    - cron: "17 6 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
+      - "patches/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: v2rayn-nopromotion-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream version
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          $tag = $env:REQUESTED_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/2dust/v2rayN/releases/latest"
+            $tag = $latest.tag_name
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Unable to resolve an upstream v2rayN release tag."
+          }
+
+          $customTag = "$tag-nopromotion.1"
+          $exists = $false
+          gh release view $customTag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+          $global:LASTEXITCODE = 0
+
+          "upstream_tag=$tag" >> $env:GITHUB_OUTPUT
+          "custom_tag=$customTag" >> $env:GITHUB_OUTPUT
+          "exists=$($exists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Upstream release: $tag"
+          Write-Host "Custom release:   $customTag"
+          Write-Host "Already exists:   $exists"
+
+      - name: Checkout exact upstream release
+        if: steps.version.outputs.exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 2dust/v2rayN
+          ref: ${{ steps.version.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Apply NoPromotion patch
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          git apply --check ../patches/remove-promotion-ui.patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "The Promotion patch no longer applies cleanly to upstream ${{ steps.version.outputs.upstream_tag }}. No build will be published."
+          }
+          git apply ../patches/remove-promotion-ui.patch
+
+          $xaml = Get-Content "v2rayN/v2rayN/Views/MainWindow.xaml" -Raw
+          if ($xaml -notmatch 'x:Name="menuPromotion"' -or $xaml -notmatch 'Visibility="Collapsed"') {
+            throw "Post-patch validation failed."
+          }
+
+      - name: Setup .NET 10
+        if: steps.version.outputs.exists != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.1xx
+
+      - name: Build Windows x64 WPF app
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        working-directory: upstream/v2rayN
+        run: |
+          dotnet publish ./v2rayN/v2rayN.csproj `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -p:EnableWindowsTargeting=true `
+            -o ../../custom-build
+
+          if (!(Test-Path "../../custom-build/v2rayN.exe")) {
+            throw "v2rayN.exe was not produced."
+          }
+
+          Get-ChildItem "../../custom-build" -Filter *.pdb -Recurse | Remove-Item -Force
+
+      - name: Package using the matching official release
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.upstream_tag }}"
+          $asset = "v2rayN-windows-64.zip"
+          $url = "https://github.com/2dust/v2rayN/releases/download/$tag/$asset"
+
+          Invoke-WebRequest -Uri $url -OutFile upstream.zip
+          Expand-Archive upstream.zip -DestinationPath package -Force
+
+          Copy-Item "custom-build/*" "package/" -Recurse -Force
+
+          $out = "v2rayN-$tag-NoPromotion-windows-64.zip"
+          Compress-Archive -Path "package/*" -DestinationPath $out -CompressionLevel Fastest
+
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $out" | Set-Content "$out.sha256" -Encoding ascii
+
+          "artifact=$out" >> $env:GITHUB_ENV
+          "hashfile=$out.sha256" >> $env:GITHUB_ENV
+
+      - name: Publish custom release
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $upstreamTag = "${{ steps.version.outputs.upstream_tag }}"
+          $customTag = "${{ steps.version.outputs.custom_tag }}"
+
+          $notes = @"
+          Unofficial Windows x64 WPF build of **v2rayN $upstreamTag** with one UI-only change: the Promotion toolbar entry is hidden.
+
+          - Upstream source/release: https://github.com/2dust/v2rayN/releases/tag/$upstreamTag
+          - Customization: `patches/remove-promotion-ui.patch`
+          - Bundled proxy cores and non-UI package files come from the matching official `v2rayN-windows-64.zip` release package.
+          - No routing, proxy-core, DNS, or networking behavior is intentionally modified.
+
+          SHA-256 is attached alongside the ZIP.
+          "@
+
+          gh release create $customTag `
+            $env:artifact `
+            $env:hashfile `
+            "patches/remove-promotion-ui.patch" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "v2rayN $upstreamTag NoPromotion" `
+            --notes $notes
+
+      - name: Nothing to do
+        if: steps.version.outputs.exists == 'true'
+        shell: pwsh
+        run: Write-Host "NoPromotion release ${{ steps.version.outputs.custom_tag }} already exists."
