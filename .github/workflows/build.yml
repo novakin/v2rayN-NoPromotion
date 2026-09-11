@@ -4,324 +4,229 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Official v2rayN release tag (leave empty for latest)"
+        description: "Official stable v2rayN tag (empty = latest)"
         required: false
         type: string
   schedule:
     - cron: "17 6 * * *"
   push:
-    branches:
-      - main
+    branches: [main, feature/quick-split-rule]
     paths:
       - ".github/workflows/build.yml"
       - "patches/**"
+      - "tests/**"
+      - "revision.txt"
 
 permissions:
-  contents: write
-
+  contents: read
 concurrency:
-  group: v2rayn-nopromotion-build
+  group: nopromotion-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: windows-latest
-
-    steps:
-      - name: Checkout builder repository
-        uses: actions/checkout@v7
-
-      - name: Resolve upstream version
-        id: version
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
         shell: pwsh
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve release and revision
+        id: version
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           $tag = $env:REQUESTED_TAG
           if ([string]::IsNullOrWhiteSpace($tag)) {
-            $tag = gh release view --repo 2dust/v2rayN --json tagName --jq .tagName
-            if ($LASTEXITCODE -ne 0) { throw "Unable to query the latest upstream release." }
+            $tag = gh api repos/2dust/v2rayN/releases/latest --jq .tag_name
+            if ($LASTEXITCODE -ne 0) { throw "Upstream release lookup failed." }
           }
-
-          if ([string]::IsNullOrWhiteSpace($tag)) {
-            throw "Unable to resolve an upstream v2rayN release tag."
-          }
-
-          $customTag = "$tag-nopromotion.1"
-          $exists = $false
-          gh release view $customTag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) { $exists = $true }
+          if ($tag -notmatch '^v?\d+\.\d+\.\d+(\.\d+)?$') { throw "Expected a numeric stable upstream tag." }
+          $revision = (Get-Content revision.txt -Raw).Trim()
+          if ($revision -notmatch '^[1-9]\d*$') { throw "Invalid builder revision." }
+          $customTag = "$tag-nopromotion.$revision"
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$customTag" 2> release-error.txt
+          $exists = $LASTEXITCODE -eq 0
+          $draft = $false
+          if ($exists) { $draft = ($releaseJson | ConvertFrom-Json).draft }
+          elseif ((Get-Content release-error.txt -Raw) -notmatch 'HTTP 404') { throw "Custom release lookup failed." }
           $global:LASTEXITCODE = 0
-
-          # Scheduled checks do nothing when this upstream release is already built.
-          # Push/manual runs intentionally rebuild and replace the custom assets so
-          # builder fixes can be applied without inventing a new upstream version.
-          $skip = $exists -and ($env:EVENT_NAME -eq "schedule")
-
-          "upstream_tag=$tag" >> $env:GITHUB_OUTPUT
+          $skip = $exists -and !$draft -and ($env:GITHUB_REF -eq 'refs/heads/main')
+          "tag=$tag" >> $env:GITHUB_OUTPUT
           "custom_tag=$customTag" >> $env:GITHUB_OUTPUT
+          "revision=$revision" >> $env:GITHUB_OUTPUT
           "exists=$($exists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          Write-Host "Upstream: $tag; custom release: $customTag; skip published release: $skip"
 
-          Write-Host "Upstream release: $tag"
-          Write-Host "Custom release:   $customTag"
-          Write-Host "Already exists:   $exists"
-          Write-Host "Skip this run:    $skip"
-
-      - name: Checkout exact upstream release
+      - name: Checkout exact upstream tag
         if: steps.version.outputs.skip != 'true'
         uses: actions/checkout@v7
         with:
           repository: 2dust/v2rayN
-          ref: ${{ steps.version.outputs.upstream_tag }}
+          ref: refs/tags/${{ steps.version.outputs.tag }}
           path: upstream
-          fetch-depth: 1
           submodules: recursive
+          persist-credentials: false
 
-      - name: Apply NoPromotion patch
+      - name: Apply ordered patches
         if: steps.version.outputs.skip != 'true'
-        shell: pwsh
         working-directory: upstream
         run: |
-          git apply --check ../patches/remove-promotion-ui.patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "The Promotion patch no longer applies cleanly to upstream ${{ steps.version.outputs.upstream_tag }}. No build will be published."
+          $patches = @(Get-Content ../patches/series | Where-Object { $_.Trim() -ne '' -and !$_.StartsWith('#') })
+          if ($patches.Count -eq 0) { throw "Empty patch series." }
+          foreach ($patch in $patches) {
+            if ($patch -notmatch '^[a-zA-Z0-9_.-]+\.patch$') { throw "Invalid patch filename." }
+            git apply --check "../patches/$patch"
+            if ($LASTEXITCODE -ne 0) { throw "Patch no longer applies: $patch. Nothing will be published." }
+            git apply "../patches/$patch"
+            if ($LASTEXITCODE -ne 0) { throw "Patch application failed: $patch." }
           }
-          git apply ../patches/remove-promotion-ui.patch
-
-          $xaml = Get-Content "v2rayN/v2rayN/Views/MainWindow.xaml" -Raw
-          if ($xaml -notmatch 'x:Name="menuPromotion"' -or $xaml -notmatch 'Visibility="Collapsed"') {
-            throw "Post-patch validation failed."
+          [xml]$xaml = Get-Content v2rayN/v2rayN/Views/MainWindow.xaml -Raw
+          $ns = New-Object System.Xml.XmlNamespaceManager($xaml.NameTable)
+          $ns.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml')
+          $promotion = $xaml.SelectSingleNode('//*[@x:Name="menuPromotion"]', $ns)
+          if ($null -eq $promotion -or $promotion.ParentNode.GetAttribute('Visibility') -ne 'Collapsed') {
+            throw "Promotion visibility validation failed."
+          }
+          $quick = $xaml.SelectSingleNode('//*[@x:Name="menuQuickSplitRule"]', $ns)
+          if ($null -eq $quick -or $quick.GetAttribute('Click') -ne 'MenuQuickSplitRule_Click') { throw "Quick Split Rule menu integration is missing." }
+          if ((Get-Content v2rayN/Directory.Build.props -Raw) -notmatch '<PublishSingleFile>true</PublishSingleFile>') {
+            throw "Upstream single-file packaging changed; review required."
           }
 
-          # Our minimal packaging strategy relies on upstream publishing the WPF app
-          # as one self-contained executable. Fail closed if upstream changes that.
-          $props = Get-Content "v2rayN/Directory.Build.props" -Raw
-          if ($props -notmatch '<PublishSingleFile>true</PublishSingleFile>') {
-            throw "Upstream no longer publishes v2rayN as a single-file executable. Packaging assumptions must be reviewed before publishing."
-          }
-
-      - name: Create patched source archive
+      - name: Setup .NET
         if: steps.version.outputs.skip != 'true'
-        shell: pwsh
-        run: |
-          $tag = "${{ steps.version.outputs.upstream_tag }}"
-          $sourceDir = "patched-source"
-          $sourceOut = "v2rayN-$tag-NoPromotion-source.zip"
-
-          # Create source before compiling so bin/obj output can never leak into the
-          # corresponding-source package.
-          New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
-          Get-ChildItem "upstream" -Force | Where-Object { $_.Name -ne ".git" } | Copy-Item -Destination $sourceDir -Recurse -Force
-
-          # A checked-out submodule contains its own .git marker file. Git metadata
-          # is not source, so remove any remaining .git entries recursively.
-          Get-ChildItem $sourceDir -Force -Recurse | Where-Object { $_.Name -eq ".git" } | Remove-Item -Recurse -Force
-
-          @"
-          This archive contains the corresponding source for the unofficial v2rayN $tag NoPromotion build.
-          Modification: the Promotion toolbar entry and its adjacent separator are hidden in the Windows WPF UI.
-          Build date (UTC): $(Get-Date -AsUTC -Format 'yyyy-MM-dd')
-          Upstream: https://github.com/2dust/v2rayN/releases/tag/$tag
-          "@ | Set-Content "$sourceDir/NOPROMOTION-MODIFICATION.txt" -Encoding utf8
-
-          Compress-Archive -Path "$sourceDir/*" -DestinationPath $sourceOut -CompressionLevel Fastest
-
-          $sourceHash = (Get-FileHash $sourceOut -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$sourceHash  $sourceOut" | Set-Content "$sourceOut.sha256" -Encoding ascii
-
-          "sourceartifact=$sourceOut" >> $env:GITHUB_ENV
-          "sourcehashfile=$sourceOut.sha256" >> $env:GITHUB_ENV
-
-      - name: Match upstream .NET toolchain
-        if: steps.version.outputs.skip != 'true'
-        shell: pwsh
-        run: |
-          dotnet --list-sdks | ForEach-Object {
-            if ($_ -match '^\S+\s+\[(.+)\]$') {
-              $sdkPath = Join-Path $Matches[1] $_.Split()[0]
-              if (Test-Path $sdkPath) {
-                Write-Host "Removing preinstalled SDK $sdkPath"
-                Remove-Item $sdkPath -Recurse -Force
-              }
-            }
-          }
-
-      - name: Setup .NET 10
-        if: steps.version.outputs.skip != 'true'
+        id: dotnet
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.1xx
 
-      - name: Build Windows x64 WPF app
+      - name: Select installed SDK without deleting runner SDKs
         if: steps.version.outputs.skip != 'true'
-        shell: pwsh
+        env:
+          SDK_VERSION: ${{ steps.dotnet.outputs.dotnet-version }}
+        run: |
+          $sdk = @{ version = $env:SDK_VERSION; rollForward = 'disable'; allowPrerelease = $false }
+          $global = Get-Content upstream/global.json -Raw | ConvertFrom-Json
+          if ($global.PSObject.Properties.Name -contains 'sdk') {
+            throw "Upstream now specifies its SDK; review the toolchain selection before publishing."
+          }
+          $global | Add-Member -NotePropertyName sdk -NotePropertyValue $sdk
+          $global | ConvertTo-Json -Depth 20 | Set-Content upstream/global.json -Encoding utf8
+          @{ sdk = $sdk } | ConvertTo-Json | Set-Content global.json -Encoding utf8
+          dotnet --version
+          if ($LASTEXITCODE -ne 0) { throw "SDK selection failed." }
+
+      - name: Archive patched source before compilation
+        if: steps.version.outputs.skip != 'true'
+        env:
+          CUSTOM_TAG: ${{ steps.version.outputs.custom_tag }}
+        run: |
+          New-Item -ItemType Directory patched-source | Out-Null
+          Get-ChildItem upstream -Force | Where-Object Name -ne '.git' | Copy-Item -Destination patched-source -Recurse -Force
+          Get-ChildItem patched-source -Force -Recurse | Where-Object Name -eq '.git' | Remove-Item -Recurse -Force
+          New-Item -ItemType Directory patched-source/nopromotion-build | Out-Null
+          Copy-Item patches,tests,.github,revision.txt,README.md -Destination patched-source/nopromotion-build -Recurse -Force
+          $upstreamSha = git -C upstream rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Cannot record source commit." }
+          @"
+          Unofficial v2rayN $env:CUSTOM_TAG.
+          Changes: Promotion hidden; Quick Split Rule dialog added. Proxy engines are unchanged.
+          Upstream commit: $upstreamSha
+          Builder commit: $env:GITHUB_SHA
+          Build date UTC: $(Get-Date -AsUTC -Format yyyy-MM-dd)
+          See nopromotion-build/README.md and the included workflow/patches/tests for build instructions.
+          "@ | Set-Content patched-source/NOPROMOTION-MODIFICATION.txt -Encoding utf8
+          $source = "v2rayN-$env:CUSTOM_TAG-source.zip"
+          Push-Location patched-source
+          & 7z a -tzip -mx=5 "../$source" . | Out-Host
+          $exitCode = $LASTEXITCODE
+          Pop-Location
+          if ($exitCode -ne 0) { throw "Source archive creation failed." }
+          "sourceartifact=$source" >> $env:GITHUB_ENV
+
+      - name: Test Quick Split Rule validation and persistence
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          dotnet run --project tests/QuickSplitRule/QuickSplitRule.Tests.csproj -c Release -p:PublishSingleFile=false -p:SelfContained=false
+          if ($LASTEXITCODE -ne 0) { throw "Quick Split Rule tests failed; no release will be published." }
+
+      - name: Build Windows x64 WPF
+        if: steps.version.outputs.skip != 'true'
         working-directory: upstream/v2rayN
         run: |
-          dotnet --version
-          dotnet publish ./v2rayN/v2rayN.csproj `
-            -c Release `
-            -r win-x64 `
-            -p:SelfContained=true `
-            -p:EnableWindowsTargeting=true `
-            -o ../../custom-build
+          dotnet publish ./v2rayN/v2rayN.csproj -c Release -r win-x64 -p:SelfContained=true -p:EnableWindowsTargeting=true -o ../../custom-build
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path ../../custom-build/v2rayN.exe)) { throw "WPF build failed." }
 
-          if (!(Test-Path "../../custom-build/v2rayN.exe")) {
-            throw "v2rayN.exe was not produced."
-          }
-
-      - name: Package from matching official release
+      - name: Replace only the application in the official ZIP
         if: steps.version.outputs.skip != 'true'
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
+          CUSTOM_TAG: ${{ steps.version.outputs.custom_tag }}
         run: |
-          $tag = "${{ steps.version.outputs.upstream_tag }}"
-          $asset = "v2rayN-windows-64.zip"
-          $officialDir = "official"
-          $officialZip = Join-Path $officialDir $asset
-          $archiveExe = "v2rayN-windows-64\v2rayN.exe"
-          $customExe = "custom-build/v2rayN.exe"
-
-          if (!(Get-Command 7z -ErrorAction SilentlyContinue)) {
-            throw "7-Zip is not available on the GitHub runner."
-          }
-
-          New-Item -ItemType Directory -Path $officialDir -Force | Out-Null
-          gh release download $tag --repo 2dust/v2rayN --pattern $asset --dir $officialDir
-          if ($LASTEXITCODE -ne 0 -or !(Test-Path $officialZip)) {
-            throw "Failed to download the matching official Windows x64 package."
-          }
-
-          # Extract only the upstream executable for validation. The output ZIP
-          # itself starts as an exact copy of the official release package.
-          New-Item -ItemType Directory -Path "official-extract" -Force | Out-Null
-          & 7z x $officialZip $archiveExe "-oofficial-extract" -y | Out-Host
-          if ($LASTEXITCODE -ne 0) { throw "Failed to inspect the official package." }
-
-          $officialExe = "official-extract/v2rayN-windows-64/v2rayN.exe"
-          if (!(Test-Path $officialExe)) {
-            throw "Unexpected upstream package layout: $archiveExe was not found."
-          }
-
-          $officialExeHash = (Get-FileHash $officialExe -Algorithm SHA256).Hash
-          $customExeHash = (Get-FileHash $customExe -Algorithm SHA256).Hash
-          Write-Host "Official v2rayN.exe SHA256: $officialExeHash"
-          Write-Host "Patched  v2rayN.exe SHA256: $customExeHash"
-          if ($officialExeHash -eq $customExeHash) {
-            throw "Patched executable is byte-identical to upstream; refusing to publish because the UI patch was not reflected in the build."
-          }
-
-          $officialExeSize = (Get-Item $officialExe).Length
-          $customExeSize = (Get-Item $customExe).Length
-          $exeRatio = [math]::Round($customExeSize / $officialExeSize, 4)
-          Write-Host "Official EXE: $officialExeSize bytes"
-          Write-Host "Patched  EXE: $customExeSize bytes"
-          Write-Host "EXE size ratio: $exeRatio"
-          if ($customExeSize -gt ($officialExeSize * 1.25) -or $customExeSize -lt ($officialExeSize * 0.75)) {
-            throw "Patched executable size differs unexpectedly from upstream."
-          }
-
-          $out = "v2rayN-$tag-NoPromotion-windows-64.zip"
-          Copy-Item $officialZip $out -Force
-
-          # Directory.Build.props sets PublishSingleFile=true, so the WPF XAML/BAML
-          # is inside v2rayN.exe. Replace exactly that one archive entry; every other
-          # entry remains from the matching official release package.
-          $overlayDir = "overlay/v2rayN-windows-64"
-          New-Item -ItemType Directory -Path $overlayDir -Force | Out-Null
-          Copy-Item $customExe "$overlayDir/v2rayN.exe" -Force
-
+          gh release download $env:UPSTREAM_TAG --repo 2dust/v2rayN --pattern v2rayN-windows-64.zip --dir official
+          if ($LASTEXITCODE -ne 0) { throw "Official package download failed." }
+          $out = "v2rayN-$env:CUSTOM_TAG-windows-64.zip"
+          Copy-Item official/v2rayN-windows-64.zip $out
+          New-Item -ItemType Directory overlay/v2rayN-windows-64 -Force | Out-Null
+          Copy-Item custom-build/v2rayN.exe overlay/v2rayN-windows-64/v2rayN.exe
           Push-Location overlay
-          & 7z u -tzip -mx=1 "../$out" "v2rayN-windows-64\v2rayN.exe" | Out-Host
-          $sevenZipExit = $LASTEXITCODE
+          & 7z a -tzip -mx=1 "../$out" 'v2rayN-windows-64\v2rayN.exe' | Out-Host
+          $exitCode = $LASTEXITCODE
           Pop-Location
-          if ($sevenZipExit -ne 0) { throw "Failed to update the official package with the patched executable." }
-
-          $officialSize = (Get-Item $officialZip).Length
-          $customSize = (Get-Item $out).Length
-          $ratio = [math]::Round($customSize / $officialSize, 4)
-          Write-Host "Official ZIP: $officialSize bytes"
-          Write-Host "Custom ZIP:   $customSize bytes"
-          Write-Host "ZIP size ratio: $ratio"
-
-          # Only one archive entry changes. Material package growth indicates a
-          # packaging regression, not a legitimate UI-only modification.
-          if ($customSize -gt ($officialSize * 1.10)) {
-            throw "Custom package is more than 10% larger than upstream; refusing to publish a malformed package."
+          if ($exitCode -ne 0) { throw "Package update failed." }
+          python tests/verify-package.py official/v2rayN-windows-64.zip $out custom-build/v2rayN.exe
+          if ($LASTEXITCODE -ne 0) { throw "Package validation failed." }
+          foreach ($file in @($out, $env:sourceartifact)) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file" | Set-Content "$file.sha256" -Encoding ascii
           }
-
-          # Re-extract the EXE from the final archive and prove it is our patched EXE.
-          Remove-Item "final-check" -Recurse -Force -ErrorAction SilentlyContinue
-          & 7z x $out $archiveExe "-ofinal-check" -y | Out-Host
-          if ($LASTEXITCODE -ne 0) { throw "Failed to validate final package." }
-          $finalExeHash = (Get-FileHash "final-check/v2rayN-windows-64/v2rayN.exe" -Algorithm SHA256).Hash
-          if ($finalExeHash -ne $customExeHash) {
-            throw "Final package does not contain the patched executable."
-          }
-
-          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $out" | Set-Content "$out.sha256" -Encoding ascii
-
           "artifact=$out" >> $env:GITHUB_ENV
-          "hashfile=$out.sha256" >> $env:GITHUB_ENV
+          "Validated package: $out ($((Get-Item $out).Length) bytes)." >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Publish custom release
-        if: steps.version.outputs.skip != 'true'
-        shell: pwsh
+      - name: Publish a new custom revision
+        if: steps.version.outputs.skip != 'true' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
+          CUSTOM_TAG: ${{ steps.version.outputs.custom_tag }}
+          RELEASE_EXISTS: ${{ steps.version.outputs.exists }}
         run: |
-          $upstreamTag = "${{ steps.version.outputs.upstream_tag }}"
-          $customTag = "${{ steps.version.outputs.custom_tag }}"
-          $releaseExists = "${{ steps.version.outputs.exists }}" -eq "true"
+          @"
+          ## Quick Split Rule
+          Open **Settings -> Quick Split Rule** to add a domain, IP/CIDR, or Windows executable-name rule to your active routing profile.
+          Choose Direct/Proxy, exact host/subdomains, and insertion position. A rule preview and local backup precede saving. Process rules require TUN.
+          Existing rules and profile settings are preserved; stale edits cannot overwrite newer rules. Reload after saving is optional and briefly interrupts connections.
 
-          $notes = @"
-          Unofficial Windows x64 WPF build of **v2rayN $upstreamTag** with one UI-only source change: the Promotion toolbar entry is hidden.
+          The Promotion entry remains hidden. This is an unofficial Windows x64 WPF build, not an upstream v2rayN release.
+          Upstream: https://github.com/2dust/v2rayN/releases/tag/$env:UPSTREAM_TAG
+          Builder commit: $env:GITHUB_SHA
+          Build: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
-          - Upstream source/release: https://github.com/2dust/v2rayN/releases/tag/$upstreamTag
-          - Customization: patches/remove-promotion-ui.patch
-          - The binary ZIP starts from the matching official v2rayN-windows-64.zip and replaces only v2rayN.exe. Upstream publishes the WPF app as a self-contained single-file executable, so that is where the compiled XAML change lives.
-          - Every other ZIP entry, including proxy cores and configuration files, remains from the matching official package.
-          - The patched corresponding-source archive is attached.
-          - No routing, proxy-core, DNS, or networking source code is modified.
-
-          SHA-256 files are attached alongside both ZIP archives.
-          "@
-
-          if ($releaseExists) {
-            gh release upload $customTag `
-              $env:artifact `
-              $env:hashfile `
-              $env:sourceartifact `
-              $env:sourcehashfile `
-              "patches/remove-promotion-ui.patch" `
-              --repo $env:GITHUB_REPOSITORY `
-              --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Failed to replace release assets." }
-
-            gh release edit $customTag `
-              --repo $env:GITHUB_REPOSITORY `
-              --title "v2rayN $upstreamTag NoPromotion" `
-              --notes $notes
-            if ($LASTEXITCODE -ne 0) { throw "Failed to update release notes." }
+          Automated validation covers rule construction, placement, backups, database writes, and package integrity. The WPF project is compiled; an interactive Windows UI test is still recommended.
+          The package differs from the official ZIP only in v2rayN.exe. Proxy cores remain unchanged. No new application dependencies or database schema are introduced.
+          The executable is unsigned. The built-in application updater still installs official builds and can remove these customizations.
+          Attached: binary, patched source (including build recipe/tests), and SHA-256 files. Do not confuse the builder-only GitHub auto-generated source ZIP with the attached patched source.
+          "@ | Set-Content release-notes.md -Encoding utf8
+          if ($env:RELEASE_EXISTS -ne 'true') {
+            gh release create $env:CUSTOM_TAG --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft --title "v2rayN $env:CUSTOM_TAG - Quick Split Rule" --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed." }
           }
-          else {
-            gh release create $customTag `
-              $env:artifact `
-              $env:hashfile `
-              $env:sourceartifact `
-              $env:sourcehashfile `
-              "patches/remove-promotion-ui.patch" `
-              --repo $env:GITHUB_REPOSITORY `
-              --title "v2rayN $upstreamTag NoPromotion" `
-              --notes $notes
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create custom release." }
-          }
+          gh release upload $env:CUSTOM_TAG $env:artifact "$env:artifact.sha256" $env:sourceartifact "$env:sourceartifact.sha256" --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Asset upload failed; release remains a draft." }
+          gh release edit $env:CUSTOM_TAG --repo $env:GITHUB_REPOSITORY --draft=false --notes-file release-notes.md --latest
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed." }
 
-      - name: Nothing to do
+      - name: Already published
         if: steps.version.outputs.skip == 'true'
-        shell: pwsh
-        run: Write-Host "NoPromotion release ${{ steps.version.outputs.custom_tag }} already exists; scheduled check is complete."
+        run: Write-Host 'This custom revision is already published. Bump revision.txt for a new feature or fix; existing published assets are not replaced.'
