@@ -1,0 +1,460 @@
+--- a/v2rayN/v2rayN/Views/MainWindow.xaml
++++ b/v2rayN/v2rayN/Views/MainWindow.xaml
+@@ -189,5 +189,10 @@
+                                     Height="{StaticResource MenuItemHeight}"
+                                     Header="{x:Static resx:ResUI.menuRoutingSetting}" />
+                                 <MenuItem
++                                    x:Name="menuQuickSplitRule"
++                                    Height="{StaticResource MenuItemHeight}"
++                                    Header="Quick Split Rule..."
++                                    Click="MenuQuickSplitRule_Click" />
++                                <MenuItem
+                                     x:Name="menuDNSSetting"
+                                     Height="{StaticResource MenuItemHeight}"
+diff --git a/v2rayN/v2rayN/Views/MainWindow.QuickSplitRule.cs b/v2rayN/v2rayN/Views/MainWindow.QuickSplitRule.cs
+new file mode 100644
+--- /dev/null
++++ b/v2rayN/v2rayN/Views/MainWindow.QuickSplitRule.cs
+@@ -0,0 +1,31 @@
++namespace v2rayN.Views;
++
++public partial class MainWindow
++{
++    private bool _quickSplitRuleOpen;
++
++    private async void MenuQuickSplitRule_Click(object sender, RoutedEventArgs e)
++    {
++        if (_quickSplitRuleOpen || ViewModel is null) return;
++        _quickSplitRuleOpen = true;
++        QuickSplitRuleWindow? dialog = null;
++        try
++        {
++            dialog = new QuickSplitRuleWindow { Owner = this };
++            await dialog.LoadProfileAsync();
++            if (dialog.ShowDialog() != true) return;
++            await ViewModel.StatusBarViewModel.RefreshRoutingsMenu();
++            if (dialog.ReloadAfterSave) await ViewModel.Reload();
++            NoticeManager.Instance.Enqueue("Quick Split Rule saved. Backup: " + dialog.BackupPath);
++        }
++        catch (Exception ex)
++        {
++            Logging.SaveLog("QuickSplitRule", ex);
++            var prefix = dialog?.Saved == true
++                ? "The rule was saved, but refreshing/reloading failed. Use Reload after checking the log.\n\n"
++                : "Quick Split Rule could not be opened.\n\n";
++            MessageBox.Show(this, prefix + ex.Message, "Quick Split Rule", MessageBoxButton.OK, MessageBoxImage.Warning);
++        }
++        finally { _quickSplitRuleOpen = false; }
++    }
++}
+diff --git a/v2rayN/v2rayN/QuickSplit/QuickSplitRuleLogic.cs b/v2rayN/v2rayN/QuickSplit/QuickSplitRuleLogic.cs
+new file mode 100644
+--- /dev/null
++++ b/v2rayN/v2rayN/QuickSplit/QuickSplitRuleLogic.cs
+@@ -0,0 +1,174 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Net;
++using System.Net.Sockets;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++using System.Text.Json.Serialization;
++using System.Text.RegularExpressions;
++using ServiceLib.Enums;
++using ServiceLib.Models.Entities;
++
++namespace v2rayN.QuickSplit;
++
++public enum SplitTargetKind { Domain, Ip, Process }
++public enum SplitPlacement { BeforeCatchAll, First }
++public sealed record SplitRulePlan(string RuleSet, string Preview, int Position, int Count);
++
++// Uses the native RulesItem schema. Existing rule objects are kept as JSON nodes
++// so that adding one rule cannot discard fields introduced by upstream.
++public static class QuickSplitRuleLogic
++{
++    private static readonly JsonSerializerOptions JsonOptions = new()
++    {
++        PropertyNameCaseInsensitive = true,
++        ReadCommentHandling = JsonCommentHandling.Skip,
++        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
++        WriteIndented = true
++    };
++
++    public static RulesItem CreateRule(string input, SplitTargetKind kind, bool includeSubdomains, string outbound)
++    {
++        if (outbound is not ("direct" or "proxy"))
++            throw new ArgumentException("Choose Direct or Proxy.");
++        var target = (input ?? "").Trim();
++        if (target.Length == 0 || target.Length > 2048 || target.Any(char.IsControl))
++            throw new ArgumentException("Enter one target, without line breaks.");
++
++        var rule = new RulesItem
++        {
++            Id = Guid.NewGuid().ToString("N"),
++            Enabled = true,
++            RuleType = ERuleType.Routing,
++            OutboundTag = outbound
++        };
++        switch (kind)
++        {
++            case SplitTargetKind.Domain:
++                target = NormalizeDomain(target);
++                rule.Domain = [(includeSubdomains ? "domain:" : "full:") + target];
++                break;
++            case SplitTargetKind.Ip:
++                target = NormalizeIp(target);
++                rule.Ip = [target];
++                break;
++            case SplitTargetKind.Process:
++                if (!Regex.IsMatch(target, @"^[^<>:""/\\|?*\x00-\x1F]+\.exe$", RegexOptions.IgnoreCase)
++                    || target.Contains(',') || target.Contains(';'))
++                    throw new ArgumentException("Enter an executable name such as Code.exe, not a path or command line.");
++                rule.Process = [target];
++                break;
++            default:
++                throw new ArgumentException("Choose a target type.");
++        }
++        rule.Remarks = $"Quick Split: {target} -> {outbound}";
++        return rule;
++    }
++
++    public static string NormalizeDomain(string target)
++    {
++        if (target.Contains("://", StringComparison.Ordinal))
++        {
++            if (!Uri.TryCreate(target, UriKind.Absolute, out var uri)
++                || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0)
++                throw new ArgumentException("Use a domain or an HTTP(S) URL without credentials.");
++            target = uri.IdnHost;
++        }
++        if (target.EndsWith('.')) target = target[..^1];
++        if (target.Length == 0 || IPAddress.TryParse(target, out _))
++            throw new ArgumentException("For an IP address, select IP / CIDR instead of Domain.");
++        try { target = new IdnMapping().GetAscii(target).ToLowerInvariant(); }
++        catch (ArgumentException) { throw new ArgumentException("This is not a valid domain name."); }
++        if (target.Length > 253 || target.Split('.').Any(label => label.Length is < 1 or > 63
++                || !Regex.IsMatch(label, @"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")))
++            throw new ArgumentException("Use a domain such as chatgpt.com. Wildcards, ports and geosite expressions belong in the full rule editor.");
++        return target;
++    }
++
++    public static string NormalizeIp(string target)
++    {
++        var parts = target.Split('/');
++        if (parts.Length > 2 || target.Any(char.IsWhiteSpace) || target.IndexOfAny(['%', '[', ']']) >= 0
++            || !IPAddress.TryParse(parts[0], out var address))
++            throw new ArgumentException("Use an IPv4/IPv6 address or CIDR, for example 192.168.1.0/24 or fd00::/8.");
++        // IPAddress accepts shorthand and legacy hex/octal IPv4; do not turn a typo into a rule.
++        if (address.AddressFamily == AddressFamily.InterNetwork
++            && !Regex.IsMatch(parts[0], @"^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$"))
++            throw new ArgumentException("IPv4 must contain four decimal octets, without leading zeroes.");
++        if (parts.Length == 1) return address.ToString();
++        var bits = address.AddressFamily == AddressFamily.InterNetwork ? 32 : 128;
++        if (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var prefix)
++            || prefix < 0 || prefix > bits)
++            throw new ArgumentException($"The CIDR prefix must be between 0 and {bits}.");
++        var bytes = address.GetAddressBytes();
++        for (var i = 0; i < bytes.Length; i++)
++        {
++            var retained = Math.Clamp(prefix - i * 8, 0, 8);
++            bytes[i] &= (byte)(0xff << (8 - retained));
++        }
++        return new IPAddress(bytes) + "/" + prefix.ToString(CultureInfo.InvariantCulture);
++    }
++
++    public static SplitRulePlan Plan(string? original, RulesItem rule, SplitPlacement placement)
++    {
++        JsonArray nodes;
++        try
++        {
++            nodes = JsonNode.Parse(string.IsNullOrWhiteSpace(original) ? "[]" : original,
++                new JsonNodeOptions { PropertyNameCaseInsensitive = true },
++                new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip }) as JsonArray
++                ?? throw new ArgumentException("The saved rules are not a JSON array. Use Routing Settings to repair them first.");
++        }
++        catch (JsonException) { throw new ArgumentException("The saved rules contain invalid JSON. Nothing has been changed."); }
++        var existing = new List<RulesItem>();
++        foreach (var node in nodes)
++        {
++            if (node is not JsonObject) throw new ArgumentException("The saved rule list contains an invalid entry.");
++            try { existing.Add(node.Deserialize<RulesItem>(JsonOptions) ?? throw new JsonException()); }
++            catch (JsonException) { throw new ArgumentException("A saved rule has an invalid field. Open Routing Settings before adding a quick rule."); }
++        }
++        var duplicate = existing.FindIndex(item => IsEquivalent(item, rule)
++            && !HasUnknownFields((JsonObject)nodes[existing.IndexOf(item)]!));
++        if (duplicate >= 0)
++            throw new ArgumentException($"An equivalent enabled rule already exists at position {duplicate + 1}. Edit or move it in Routing Settings instead.");
++
++        if (placement is not (SplitPlacement.First or SplitPlacement.BeforeCatchAll))
++            throw new ArgumentException("Choose an insertion position.");
++        var index = placement == SplitPlacement.First ? 0 : nodes.Count;
++        if (placement == SplitPlacement.BeforeCatchAll)
++        {
++            for (var i = 0; i < existing.Count; i++)
++            {
++                if (IsCatchAll(existing[i]) && !HasUnknownFields((JsonObject)nodes[i]!))
++                { index = i; break; }
++            }
++        }
++        var position = index == nodes.Count ? "At the end (no general catch-all found)."
++            : index == 0 ? "First rule (highest priority in this profile)."
++            : $"Before rule {index + 1}: {existing[index].Remarks ?? existing[index].OutboundTag}.";
++        var prior = index > 0 ? $"\n{index} earlier rule(s) remain ahead of this one and may take precedence. Choose First to make this an override." : "";
++        var preview = $"Insert at position {index + 1}. {position}{prior}\n\n" + JsonSerializer.Serialize(rule, JsonOptions);
++        nodes.Insert(index, JsonSerializer.SerializeToNode(rule, JsonOptions));
++        return new SplitRulePlan(nodes.ToJsonString(JsonOptions), preview, index + 1, nodes.Count);
++    }
++
++    private static readonly HashSet<string> KnownFields = new(StringComparer.OrdinalIgnoreCase)
++    { "Id", "Type", "Port", "Network", "InboundTag", "OutboundTag", "Ip", "Domain", "Protocol", "Process", "Enabled", "Remarks", "RuleType" };
++    private static bool HasUnknownFields(JsonObject node) => node.Any(pair => pair.Value != null && !KnownFields.Contains(pair.Key));
++    private static bool Has(ICollection<string>? values) => values?.Count > 0;
++    private static bool Routing(RulesItem rule) => rule.Enabled && (rule.RuleType is null or ERuleType.ALL or ERuleType.Routing);
++    private static bool Unrestricted(RulesItem rule) => string.IsNullOrWhiteSpace(rule.Network)
++        && string.IsNullOrWhiteSpace(rule.Port) && !Has(rule.Protocol) && !Has(rule.InboundTag);
++    private static bool Same(ICollection<string>? a, ICollection<string>? b) =>
++        (a ?? []).OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
++            .SequenceEqual((b ?? []).OrderBy(x => x, StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
++    private static bool IsEquivalent(RulesItem a, RulesItem b) => Routing(a) && Unrestricted(a)
++        && string.Equals(a.OutboundTag, b.OutboundTag, StringComparison.OrdinalIgnoreCase)
++        && Same(a.Domain, b.Domain) && Same(a.Ip, b.Ip) && Same(a.Process, b.Process);
++    private static bool IsCatchAll(RulesItem rule) => Routing(rule) && !string.IsNullOrWhiteSpace(rule.OutboundTag)
++        && !Has(rule.Domain) && !Has(rule.Ip) && !Has(rule.Process) && !Has(rule.Protocol) && !Has(rule.InboundTag)
++        && (string.IsNullOrWhiteSpace(rule.Port) || rule.Port.Trim() is "0-65535" or "1-65535")
++        && (string.IsNullOrWhiteSpace(rule.Network) || Same(rule.Network.Split(',').Select(x => x.Trim()).ToArray(), ["tcp", "udp"]));
++}
+diff --git a/v2rayN/v2rayN/QuickSplit/QuickSplitRuleStore.cs b/v2rayN/v2rayN/QuickSplit/QuickSplitRuleStore.cs
+new file mode 100644
+--- /dev/null
++++ b/v2rayN/v2rayN/QuickSplit/QuickSplitRuleStore.cs
+@@ -0,0 +1,37 @@
++using System;
++using System.IO;
++using System.Text;
++using SQLite;
++using ServiceLib.Models.Entities;
++
++namespace v2rayN.QuickSplit;
++
++public static class QuickSplitRuleStore
++{
++    public static string Save(string databasePath, string backupDirectory, RoutingItem snapshot, SplitRulePlan plan)
++    {
++        if (!File.Exists(databasePath)) throw new IOException("The existing v2rayN configuration database was not found.");
++        if (!snapshot.IsActive || !snapshot.Enabled || snapshot.Locked || string.IsNullOrWhiteSpace(snapshot.Id))
++            throw new InvalidOperationException("Select an active, enabled, editable routing profile first.");
++        Directory.CreateDirectory(backupDirectory);
++        var backup = Path.Combine(backupDirectory, $"rules-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}-{Guid.NewGuid():N}.json");
++        using (var stream = new FileStream(backup, FileMode.CreateNew, FileAccess.Write, FileShare.None))
++        using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
++        {
++            writer.Write(string.IsNullOrWhiteSpace(snapshot.RuleSet) ? "[]" : snapshot.RuleSet);
++            writer.Flush();
++            stream.Flush(true);
++        }
++        // Use the same SQLite library and table as upstream. A parameterized,
++        // conditional update prevents stale dialogs from replacing newer rules.
++        // Only the two rule fields change; other profile settings are untouched.
++        using var db = new SQLiteConnection(databasePath, false);
++        var changed = db.Execute(
++            "UPDATE RoutingItem SET RuleSet = ?, RuleNum = ? " +
++            "WHERE Id = ? AND RuleSet IS ? AND IsActive = 1 AND Enabled = 1 AND Locked = 0",
++            plan.RuleSet, plan.Count, snapshot.Id, snapshot.RuleSet);
++        if (changed != 1)
++            throw new InvalidOperationException("The routing profile changed while this window was open. No rule was saved. Close it and try again. Backup: " + backup);
++        return backup;
++    }
++}
+diff --git a/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml b/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml
+new file mode 100644
+--- /dev/null
++++ b/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml
+@@ -0,0 +1,60 @@
++<Window x:Class="v2rayN.Views.QuickSplitRuleWindow"
++    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
++    Title="Quick Split Rule" Width="660" Height="760" MinWidth="560" MinHeight="560"
++    ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
++    Style="{StaticResource WindowGlobal}" Closing="Window_Closing">
++    <DockPanel Margin="20">
++        <StackPanel DockPanel.Dock="Bottom">
++            <TextBlock x:Name="txtError" TextWrapping="Wrap" Margin="0,8,0,8"
++                       FontWeight="SemiBold" AutomationProperties.LiveSetting="Polite" />
++            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
++                <Button x:Name="btnCancel" Content="Cancel" IsCancel="True" MinWidth="90" Margin="0,0,12,0" />
++                <Button x:Name="btnSave" Content="Add rule" IsDefault="True" MinWidth="110"
++                        IsEnabled="False" Click="Save_Click" />
++            </StackPanel>
++        </StackPanel>
++        <ScrollViewer VerticalScrollBarVisibility="Auto">
++            <StackPanel x:Name="form">
++                <TextBlock Text="Quick Split Rule" FontSize="22" FontWeight="SemiBold" />
++                <TextBlock Text="One target. One routing rule. Existing rules stay in place."
++                           TextWrapping="Wrap" Margin="0,4,0,16" />
++                <TextBlock x:Name="txtProfile" FontWeight="SemiBold" TextWrapping="Wrap" />
++                <TextBlock x:Name="txtProfileWarning" TextWrapping="Wrap" Margin="0,4,0,12" />
++                <Grid>
++                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
++                    <StackPanel Margin="0,0,12,0">
++                        <Label Target="{Binding ElementName=cmbType}" Content="Target type" Padding="0,0,0,4" />
++                        <ComboBox x:Name="cmbType" SelectedIndex="0" SelectionChanged="Input_Changed">
++                            <ComboBoxItem Content="Domain / website" /><ComboBoxItem Content="IP / CIDR" /><ComboBoxItem Content="Windows process" />
++                        </ComboBox>
++                    </StackPanel>
++                    <StackPanel Grid.Column="1">
++                        <Label Target="{Binding ElementName=cmbOutbound}" Content="Route through" Padding="0,0,0,4" />
++                        <ComboBox x:Name="cmbOutbound" SelectedIndex="1" SelectionChanged="Input_Changed">
++                            <ComboBoxItem Content="Direct (bypass proxy)" /><ComboBoxItem Content="Proxy (current server)" />
++                        </ComboBox>
++                    </StackPanel>
++                </Grid>
++                <Label Target="{Binding ElementName=txtTarget}" Content="Target" Padding="0,14,0,4" />
++                <TextBox x:Name="txtTarget" MaxLength="2048" TextChanged="Target_Changed" />
++                <TextBlock x:Name="txtHint" TextWrapping="Wrap" Margin="0,4,0,8" />
++                <CheckBox x:Name="chkSubdomains" Content="Include this domain and its subdomains"
++                          IsChecked="True" Checked="Option_Changed" Unchecked="Option_Changed" Margin="0,0,0,12" />
++                <Label Target="{Binding ElementName=cmbPlacement}" Content="Position in the active profile" Padding="0,0,0,4" />
++                <ComboBox x:Name="cmbPlacement" SelectedIndex="0" SelectionChanged="Input_Changed">
++                    <ComboBoxItem Content="Before the first general catch-all (keep earlier rules)" />
++                    <ComboBoxItem Content="First rule (highest priority / explicit override)" />
++                </ComboBox>
++                <TextBlock Text="Rule preview" FontWeight="SemiBold" Margin="0,14,0,6" />
++                <TextBox x:Name="txtPreview" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
++                         MinHeight="150" MaxHeight="260" VerticalScrollBarVisibility="Auto"
++                         FontFamily="Consolas" FontSize="12" />
++                <CheckBox x:Name="chkReload" Content="Reload core after saving (briefly interrupts connections)"
++                          IsChecked="True" Margin="0,14,0,8" />
++                <TextBlock Text="A local backup of this profile's rules is required before saving. Domain rules need a hostname visible to the core; a website may use other domains too. Direct rules bypass the proxy, not the TUN interface itself."
++                           TextWrapping="Wrap" FontSize="12" />
++            </StackPanel>
++        </ScrollViewer>
++    </DockPanel>
++</Window>
+diff --git a/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml.cs b/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml.cs
+new file mode 100644
+--- /dev/null
++++ b/v2rayN/v2rayN/Views/QuickSplitRuleWindow.xaml.cs
+@@ -0,0 +1,120 @@
++using System.Windows.Controls;
++using v2rayN.QuickSplit;
++
++namespace v2rayN.Views;
++
++public partial class QuickSplitRuleWindow : Window
++{
++    private RoutingItem? _snapshot;
++    private bool _ready;
++    private bool _saving;
++    public bool Saved { get; private set; }
++    public bool ReloadAfterSave { get; private set; }
++    public string BackupPath { get; private set; } = "";
++
++    public QuickSplitRuleWindow()
++    {
++        InitializeComponent();
++        _ready = true;
++        Loaded += (_, _) => txtTarget.Focus();
++    }
++
++    public async Task LoadProfileAsync()
++    {
++        var items = await AppManager.Instance.RoutingItems();
++        var active = items?.Where(item => item.IsActive).ToList();
++        if (active?.Count != 1)
++            throw new InvalidOperationException("Select an active routing profile in the main window first.");
++        _snapshot = active[0];
++        if (!_snapshot.Enabled || _snapshot.Locked)
++            throw new InvalidOperationException("This routing profile is disabled or locked. Create an editable copy in Routing Settings and select it first.");
++        var server = await AppManager.Instance.GetProfileItem(AppManager.Instance.Config.IndexId);
++        if (server is null || server.ConfigType == EConfigType.Custom)
++            throw new InvalidOperationException("Select a normal server configuration first. Custom configuration files are not edited by Quick Split Rule.");
++        txtProfile.Text = "Active routing profile: " + _snapshot.Remarks;
++        txtProfileWarning.Text = string.IsNullOrWhiteSpace(_snapshot.Url) ? ""
++            : "This profile has an update URL. Re-importing its rules may overwrite your local changes.";
++        RefreshPreview();
++    }
++
++    private SplitRulePlan BuildPlan()
++    {
++        if (_snapshot is null) throw new InvalidOperationException("No editable routing profile is selected.");
++        var kind = (SplitTargetKind)cmbType.SelectedIndex;
++        if (kind == SplitTargetKind.Process && !AppManager.Instance.Config.TunModeItem.EnableTun)
++            throw new ArgumentException("Process rules require TUN mode. Enable TUN first, or add a domain/IP rule.");
++        var rule = QuickSplitRuleLogic.CreateRule(txtTarget.Text, kind, chkSubdomains.IsChecked == true,
++            cmbOutbound.SelectedIndex == 0 ? "direct" : "proxy");
++        return QuickSplitRuleLogic.Plan(_snapshot.RuleSet, rule, (SplitPlacement)cmbPlacement.SelectedIndex);
++    }
++
++    private void RefreshPreview()
++    {
++        if (!_ready || _saving || _snapshot is null) return;
++        chkSubdomains.Visibility = cmbType.SelectedIndex == 0 ? Visibility.Visible : Visibility.Collapsed;
++        txtHint.Text = cmbType.SelectedIndex switch
++        {
++            0 => "Example: chatgpt.com. Pasted HTTP(S) URLs use only their host; paths and ports are not matched.",
++            1 => "Example: 192.168.1.0/24, 1.1.1.1, or fd00::/8. CIDR host bits are normalized in the preview.",
++            _ => "Example: Code.exe. Matches that executable name, not every child process. TUN is required."
++        };
++        try
++        {
++            var plan = BuildPlan();
++            txtPreview.Text = plan.Preview;
++            txtError.Text = "";
++            btnSave.IsEnabled = true;
++        }
++        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
++        {
++            txtPreview.Text = "";
++            txtError.Text = string.IsNullOrWhiteSpace(txtTarget.Text) ? "" : ex.Message;
++            btnSave.IsEnabled = false;
++        }
++    }
++
++    private async void Save_Click(object sender, RoutedEventArgs e)
++    {
++        if (_saving || _snapshot is null) return;
++        _saving = true;
++        form.IsEnabled = btnSave.IsEnabled = btnCancel.IsEnabled = false;
++        try
++        {
++            var plan = BuildPlan();
++            var config = AppManager.Instance.Config;
++            var items = await AppManager.Instance.RoutingItems();
++            var current = items?.FirstOrDefault(item => item.Id == _snapshot.Id);
++            if (current is null || !current.IsActive || !current.Enabled || current.Locked
++                || current.RuleSet != _snapshot.RuleSet)
++                throw new InvalidOperationException("The routing profile changed while this window was open. Close it and try again; no rule was saved.");
++            var server = await AppManager.Instance.GetProfileItem(config.IndexId);
++            if (server is null || server.ConfigType == EConfigType.Custom)
++                throw new InvalidOperationException("The server configuration changed. Close this window and try again.");
++
++            BackupPath = QuickSplitRuleStore.Save(
++                Utils.GetConfigPath("guiNDB.db"), Utils.GetConfigPath("quick-split-backups"),
++                _snapshot, plan);
++            Saved = true;
++            ReloadAfterSave = chkReload.IsChecked == true;
++            _saving = false;
++            DialogResult = true;
++        }
++        catch (Exception ex)
++        {
++            Logging.SaveLog("QuickSplitRule", ex);
++            txtError.Text = ex.Message;
++        }
++        finally
++        {
++            _saving = false;
++            form.IsEnabled = btnCancel.IsEnabled = true;
++            // Keep save errors visible until the next edit; prevent accidental repeat submissions.
++            btnSave.IsEnabled = false;
++        }
++    }
++
++    private void Window_Closing(object? sender, CancelEventArgs e) { if (_saving) e.Cancel = true; }
++    private void Input_Changed(object sender, SelectionChangedEventArgs e) => RefreshPreview();
++    private void Target_Changed(object sender, TextChangedEventArgs e) => RefreshPreview();
++    private void Option_Changed(object sender, RoutedEventArgs e) => RefreshPreview();
++}
